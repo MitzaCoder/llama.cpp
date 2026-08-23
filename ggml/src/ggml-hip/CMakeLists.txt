@@ -51,6 +51,10 @@ if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
 endif()
 
+if (GGML_HIP_CUB)
+    find_package(hipcub REQUIRED)
+endif()
+
 if (${hip_VERSION} VERSION_LESS 6.1)
     message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
 endif()
@@ -113,6 +117,10 @@ if (GGML_HIP_RCCL)
     add_compile_definitions(GGML_USE_NCCL) # RCCL has the same interface as NCCL.
 endif()
 
+if (GGML_HIP_CUB)
+    add_compile_definitions(GGML_HIP_CUB)
+endif()
+
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
@@ -139,6 +147,10 @@ endif()
 
 if (GGML_HIP_RCCL)
     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
+endif()
+
+if (GGML_HIP_CUB)
+    target_link_libraries(ggml-hip PRIVATE hip::hipcub)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)

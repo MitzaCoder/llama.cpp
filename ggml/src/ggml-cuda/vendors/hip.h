@@ -6,6 +6,12 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
+#ifdef GGML_HIP_CUB
+#include <hipcub/hipcub.hpp>
+// hipCUB keeps the CUB names, so alias it and the shared code needs no changes.
+namespace cub = hipcub;
+#endif // GGML_HIP_CUB
+
 #ifdef GGML_USE_NCCL
 #include <rccl/rccl.h>
 #endif // GGML_USE_NCCL
@@ -143,6 +149,9 @@
 #define cudaGraphExecUpdate hipGraphExecUpdate
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
 #define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaGraph_t hipGraph_t
 #define cudaStream_t hipStream_t
 #define cudaSuccess hipSuccess

@@ -1,7 +1,9 @@
 #include "argsort.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
+#ifndef GGML_USE_HIP // on HIP, vendors/hip.h provides hipCUB
 #    include <cub/cub.cuh>
+#endif
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
 #        define STRIDED_ITERATOR_AVAILABLE
 #        include <cuda/iterator>
