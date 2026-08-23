@@ -5,7 +5,9 @@
 #include "ggml.h"
 
 #ifdef GGML_CUDA_USE_CUB
+#ifndef GGML_USE_HIP // on HIP, vendors/hip.h provides hipCUB
 #   include <cub/cub.cuh>
+#endif
 #endif // GGML_CUDA_USE_CUB
 
 template<typename T, int BLOCK_SIZE>
