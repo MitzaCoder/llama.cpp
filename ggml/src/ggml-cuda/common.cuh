@@ -109,6 +109,10 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 #    define GGML_CUDA_USE_CUB
+#elif defined(GGML_USE_HIP) && defined(GGML_HIP_CUB)
+// hipCUB maps the CUB API onto rocPRIM, so the shared CUB code paths build on HIP.
+// This also lifts the ne[0] <= 1024 limit that TOP_K and ARGSORT report without CUB.
+#    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
