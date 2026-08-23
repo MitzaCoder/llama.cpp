@@ -2,7 +2,9 @@
 #include "reduce_rows.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
+#ifndef GGML_USE_HIP // on HIP, vendors/hip.h provides hipCUB
 #include <cub/cub.cuh>
+#endif
 using namespace cub;
 #endif  // GGML_CUDA_USE_CUB
 
