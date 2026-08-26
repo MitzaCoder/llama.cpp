@@ -39,6 +39,30 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx);
 
+    // GLM5Next packs an indexer key and a k-pool gate into each cache row.
+    llama_memory_hybrid_idx(
+        const llama_model & model,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                     bool   v_trans,
+                 uint32_t   kv_size,
+                 uint32_t   n_pad,
+                 uint32_t   n_swa,
+           llama_swa_type   swa_type,
+                ggml_type   type_r,
+                ggml_type   type_s,
+                 uint32_t   rs_size,
+                 uint32_t   idx_row_size,
+                 uint32_t   idx_kpool,
+                     bool   idx_select_tail,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_rs_seq,
+                     bool   offload,
+                     bool   unified,
+    const layer_filter_cb & filter_attn,
+    const layer_filter_cb & filter_recr,
+    const layer_filter_cb & filter_idx);
+
     ~llama_memory_hybrid_idx() = default;
 
     //
@@ -75,6 +99,9 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    uint32_t get_kpool()       const { return kpool;       }
+    bool     get_select_tail() const { return select_tail; }
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -83,6 +110,9 @@ private:
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
+
+    const uint32_t kpool       = 1;
+    const bool     select_tail = false;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 };
@@ -141,8 +171,18 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
+    // GLM5Next k-pool metadata over the same cells as the attention cache.
+    void set_input_kpool(
+            ggml_tensor * cell_pool,
+            ggml_tensor * pool_cells,
+            ggml_tensor * bias,
+            const llama_ubatch * ubatch) const;
+
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
+
+    const uint32_t kpool       = 1;
+    const bool     select_tail = false;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

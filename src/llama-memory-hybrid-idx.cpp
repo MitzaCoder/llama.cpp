@@ -17,7 +17,6 @@
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
-                            /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -25,16 +24,43 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
-                            /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
-                            /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
-                            /* layer filters */
+    const layer_filter_cb & filter_attn,
+    const layer_filter_cb & filter_recr,
+    const layer_filter_cb & filter_idx) :
+    llama_memory_hybrid_idx(
+        model,
+        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        type_r, type_s, rs_size,
+        model.hparams.indexer_head_size, 0, false,
+        n_seq_max, n_rs_seq, offload, unified,
+        filter_attn, filter_recr, filter_idx) {}
+
+llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+        const llama_model & model,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                     bool   v_trans,
+                 uint32_t   kv_size,
+                 uint32_t   n_pad,
+                 uint32_t   n_swa,
+           llama_swa_type   swa_type,
+                ggml_type   type_r,
+                ggml_type   type_s,
+                 uint32_t   rs_size,
+                 uint32_t   idx_row_size,
+                 uint32_t   idx_kpool,
+                     bool   idx_select_tail,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_rs_seq,
+                     bool   offload,
+                     bool   unified,
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
     const layer_filter_cb & filter_idx) :
@@ -45,15 +71,24 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
+    kpool(idx_kpool > 0 ? idx_kpool : 1),
+    select_tail(idx_select_tail),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
-        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        GGML_ASSERT(idx_row_size > 0);
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
+        hparams_idx.n_embd_head_k_full = idx_row_size;
+        hparams_idx.n_embd_head_k_swa  = idx_row_size;
+
+        const bool is_kpool = idx_kpool > 0;
+        const ggml_type idx_type_k = is_kpool ? GGML_TYPE_F16 : type_k;
+        const ggml_type idx_type_v = is_kpool ? GGML_TYPE_F16 : type_v;
+
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, row = %u\n",
+                __func__, kv_size, idx_row_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, idx_type_k, idx_type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
@@ -283,6 +318,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_st
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
     llama_memory_hybrid_context(mem),
     mem(mem),
+    kpool(mem->get_kpool()),
+    select_tail(mem->get_select_tail()),
     // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
@@ -295,7 +332,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
                   llama_context * lctx,
                            bool   optimize) :
     llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem) {}
+    mem(mem),
+    kpool(mem->get_kpool()),
+    select_tail(mem->get_select_tail()) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -305,6 +344,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     // note: the base copies the ubatches; ctx_idx gets a copy of its own
     llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
     mem(mem),
+    kpool(mem->get_kpool()),
+    select_tail(mem->get_select_tail()),
     ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
@@ -456,6 +497,106 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
                     // finite, so it can never meet a -inf and produce a nan
                     v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                }
+
+                cur_bias[j] = v;
+            }
+        }
+    }
+}
+
+void llama_memory_hybrid_idx_context::set_input_kpool(
+        ggml_tensor * cell_pool,
+        ggml_tensor * pool_cells,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
+    GGML_ASSERT(cell_pool->type == GGML_TYPE_I32 && pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+
+    const int64_t r      = kpool;
+    const int64_t n_kv   = cell_pool->ne[0];
+    const int64_t n_ns   = cell_pool->ne[1];   // streams in this ubatch
+    const int64_t n_pool = pool_cells->ne[0]/r;
+
+    GGML_ASSERT(r > 0 && n_pool > 0);
+    GGML_ASSERT(ubatch->n_tokens % n_ns == 0);
+
+    const int64_t n_tps = ubatch->n_tokens/n_ns;
+
+    int32_t * dst_cell_pool  = (int32_t *) cell_pool->data;
+    int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
+    float   * dst_bias       = (float   *) bias->data;
+
+    // one pass per stream: cell j is a different token in each
+    std::vector<int32_t> pool_of(n_kv);
+    std::vector<int32_t> filled(n_pool);
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+
+        const auto & cells = mem->get_mem_attn()->get_cells(seq_of_stream);
+
+        int32_t * cur_cell_pool  = dst_cell_pool  + s*n_kv;
+        int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pool);
+
+        // pool b covers token positions [b*r, (b+1)*r). -1 = the cell has no usable pool.
+        std::fill(pool_of.begin(), pool_of.end(), -1);
+        std::fill(filled.begin(),  filled.end(),   0);
+        std::fill(cur_pool_cells, cur_pool_cells + r*n_pool, 0);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j)) {
+                continue;
+            }
+
+            const llama_pos p = cells.pos_get(j);
+            const int64_t   b = p/r;
+
+            if (b >= n_pool) {
+                continue;
+            }
+
+            pool_of[j] = (int32_t) b;
+            cur_pool_cells[b*r + (p%r)] = (int32_t) j;
+            filled[b]++;
+        }
+
+        // an incomplete pool cannot be pooled: its cells are reachable only through the tail
+        // bias below, and cell 0 in pool_cells only keeps the gather in range
+        for (int64_t b = 0; b < n_pool; ++b) {
+            if (filled[b] < (int32_t) r) {
+                std::fill(cur_pool_cells + b*r, cur_pool_cells + (b + 1)*r, 0);
+            }
+        }
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (pool_of[j] >= 0 && filled[pool_of[j]] < (int32_t) r) {
+                pool_of[j] = -1;
+            }
+            cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
+        }
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t      i      = s*n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const llama_pos    q      = ubatch->pos[i];
+
+            // the rest is an incomplete pool that is always attended to, which is what lands
+            // the selection on pool boundaries like the reference. Without select_tail the
+            // trailing cells simply stay invisible.
+            const llama_pos tail_start = select_tail ? (q + 1)/(llama_pos) r*(llama_pos) r : q + 1;
+
+            float * cur_bias = dst_bias + i*n_kv;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                float v = -INFINITY;
+
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
+                    // finite, so it can never meet a -inf and produce a nan
+                    v = cells.pos_get(j) >= tail_start ? 1e9f : (pool_of[j] < 0 ? -INFINITY : 0.0f);
                 }
 
                 cur_bias[j] = v;
