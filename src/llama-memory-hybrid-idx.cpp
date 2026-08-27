@@ -506,45 +506,51 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 }
 
 void llama_memory_hybrid_idx_context::set_input_kpool(
-        ggml_tensor * cell_pool,
         ggml_tensor * pool_cells,
-        ggml_tensor * bias,
+        ggml_tensor * pool_bias,
+        ggml_tensor * tail_cells,
         const llama_ubatch * ubatch) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
-    GGML_ASSERT(cell_pool->type == GGML_TYPE_I32 && pool_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool_bias->buffer));
+    GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(pool_bias->type  == GGML_TYPE_F32);
 
     const int64_t r      = kpool;
-    const int64_t n_kv   = cell_pool->ne[0];
-    const int64_t n_ns   = cell_pool->ne[1];   // streams in this ubatch
-    const int64_t n_pool = pool_cells->ne[0]/r;
+    const int64_t n_kv   = get_attn()->get_n_kv();
+    const int64_t n_ns   = pool_cells->ne[1];   // streams in this ubatch
+    const int64_t n_pool = pool_bias->ne[0];
 
     GGML_ASSERT(r > 0 && n_pool > 0);
+    GGML_ASSERT(pool_cells->ne[0] == r*n_pool);
     GGML_ASSERT(ubatch->n_tokens % n_ns == 0);
 
     const int64_t n_tps = ubatch->n_tokens/n_ns;
 
-    int32_t * dst_cell_pool  = (int32_t *) cell_pool->data;
     int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
-    float   * dst_bias       = (float   *) bias->data;
+    float   * dst_pool_bias  = (float   *) pool_bias->data;
+    int32_t * dst_tail_cells = nullptr;
+
+    if (tail_cells) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(tail_cells->buffer));
+        GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(tail_cells->ne[0] == r - 1);
+
+        dst_tail_cells = (int32_t *) tail_cells->data;
+    }
 
     // one pass per stream: cell j is a different token in each
-    std::vector<int32_t> pool_of(n_kv);
     std::vector<int32_t> filled(n_pool);
+    std::vector<int32_t> cell_of_pos;
 
     for (int64_t s = 0; s < n_ns; ++s) {
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
 
         const auto & cells = mem->get_mem_attn()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_pool  = dst_cell_pool  + s*n_kv;
         int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pool);
 
-        // pool b covers token positions [b*r, (b+1)*r). -1 = the cell has no usable pool.
-        std::fill(pool_of.begin(), pool_of.end(), -1);
-        std::fill(filled.begin(),  filled.end(),   0);
+        // pool b covers token positions [b*r, (b+1)*r)
+        std::fill(filled.begin(), filled.end(), 0);
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pool, 0);
 
         for (int64_t j = 0; j < n_kv; ++j) {
@@ -559,47 +565,82 @@ void llama_memory_hybrid_idx_context::set_input_kpool(
                 continue;
             }
 
-            pool_of[j] = (int32_t) b;
             cur_pool_cells[b*r + (p%r)] = (int32_t) j;
             filled[b]++;
         }
 
-        // an incomplete pool cannot be pooled: its cells are reachable only through the tail
-        // bias below, and cell 0 in pool_cells only keeps the gather in range
+        // an incomplete pool has no pool key: pool_bias below never lets a query pick it, and
+        // cell 0 in pool_cells only keeps the gather in range
         for (int64_t b = 0; b < n_pool; ++b) {
             if (filled[b] < (int32_t) r) {
                 std::fill(cur_pool_cells + b*r, cur_pool_cells + (b + 1)*r, 0);
             }
         }
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (pool_of[j] >= 0 && filled[pool_of[j]] < (int32_t) r) {
-                pool_of[j] = -1;
+        llama_pos max_pos    = -1;
+        int32_t   pad_masked = -1;
+
+        if (dst_tail_cells) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j) || !cells.seq_has(j, seq_of_stream)) {
+                    pad_masked = (int32_t) j; // the KQ mask rejects it for every query below
+                    continue;
+                }
+
+                max_pos = std::max(max_pos, cells.pos_get(j));
             }
-            cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
+
+            cell_of_pos.assign(max_pos + 1, -1);
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_of_stream)) {
+                    cell_of_pos[cells.pos_get(j)] = (int32_t) j;
+                }
+            }
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
-            const int64_t      i      = s*n_tps + ii;
-            const llama_seq_id seq_id = ubatch->seq_id[i][0];
-            const llama_pos    q      = ubatch->pos[i];
+            const int64_t   i = s*n_tps + ii;
+            const llama_pos q = ubatch->pos[i];
 
-            // the rest is an incomplete pool that is always attended to, which is what lands
-            // the selection on pool boundaries like the reference. Without select_tail the
-            // trailing cells simply stay invisible.
-            const llama_pos tail_start = select_tail ? (q + 1)/(llama_pos) r*(llama_pos) r : q + 1;
+            // a query may pick a pool only if the pool is complete and its last member is
+            // visible, which is the reference's pool_valid & pool_visible
+            float * cur_bias = dst_pool_bias + i*n_pool;
 
-            float * cur_bias = dst_bias + i*n_kv;
+            for (int64_t b = 0; b < n_pool; ++b) {
+                const bool ok = filled[b] == (int32_t) r && (llama_pos) ((b + 1)*r - 1) <= q;
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                float v = -INFINITY;
+                cur_bias[b] = ok ? 0.0f : -INFINITY;
+            }
 
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f : (pool_of[j] < 0 ? -INFINITY : 0.0f);
-                }
+            if (!dst_tail_cells) {
+                continue;
+            }
 
-                cur_bias[j] = v;
+            // positions [tail_start, q] are the trailing incomplete pool. A pickable pool ends
+            // at or before tail_start - 1, so the tail never overlaps one and nothing is
+            // counted twice.
+            const llama_pos tail_start = (q + 1)/(llama_pos) r*(llama_pos) r;
+
+            // the reference pads the tail with -1; set_rows has no -1 but tolerates duplicates,
+            // so pad with a cell the KQ mask rejects anyway. Only a full cache that holds this
+            // sequence alone and ends exactly at q has none - the query then pads with itself.
+            int32_t pad = pad_masked;
+
+            if (pad < 0 && max_pos > q) {
+                pad = cell_of_pos[max_pos];
+            }
+
+            if (pad < 0) {
+                pad = q <= max_pos && cell_of_pos[q] >= 0 ? cell_of_pos[q] : 0;
+            }
+
+            int32_t * cur_tail = dst_tail_cells + i*(r - 1);
+
+            for (int64_t t = 0; t < r - 1; ++t) {
+                const llama_pos p = tail_start + (llama_pos) t;
+
+                cur_tail[t] = (p <= q && p <= max_pos && cell_of_pos[p] >= 0) ? cell_of_pos[p] : pad;
             }
         }
     }

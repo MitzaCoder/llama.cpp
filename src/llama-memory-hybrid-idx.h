@@ -171,11 +171,19 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
-    // GLM5Next k-pool metadata over the same cells as the attention cache.
+    uint32_t get_kpool()       const { return kpool;       }
+    bool     get_select_tail() const { return select_tail; }
+
+    // GLM5Next k-pool metadata over the same cells as the attention cache:
+    //   pool_cells I32 [kpool*n_pools, ns]     the cells making up each complete pool
+    //   pool_bias  F32 [n_pools, n_tps, ns]    0 for a pool the query may select, -INF otherwise
+    //   tail_cells I32 [kpool-1, n_tps, 1, ns] the always-selected cells past the last pool
+    // Pools are runs of consecutive token positions, so cache cells need not be contiguous.
+    // Incomplete pools are reachable only through tail_cells.
     void set_input_kpool(
-            ggml_tensor * cell_pool,
             ggml_tensor * pool_cells,
-            ggml_tensor * bias,
+            ggml_tensor * pool_bias,
+            ggml_tensor * tail_cells,
             const llama_ubatch * ubatch) const;
 
 private:
