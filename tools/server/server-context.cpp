@@ -951,6 +951,40 @@ private:
         mctx = nullptr;
     }
 
+    // what the prompt cache's disk entries depend on: states saved under another key are never loaded
+    std::string prompt_cache_key() const {
+        auto file = [](const std::string & path) {
+            std::error_code ec;
+            const auto size = path.empty() ? 0 : std::filesystem::file_size(path, ec);
+            const auto time = path.empty() ? std::filesystem::file_time_type() : std::filesystem::last_write_time(path, ec);
+            return string_format("%s %llu %lld", path.c_str(), (unsigned long long) size,
+                                 (long long) std::chrono::duration_cast<std::chrono::seconds>(time.time_since_epoch()).count());
+        };
+        const auto & p = params_base;
+        return string_format(
+            "llama.cpp prompt cache 1 | build %s | model %s | draft %s | mmproj %s | n_ctx %d %d | n_parallel %d | "
+            "kv %d %d | draft kv %d %d | swa_full %d | kv_unified %d | flash_attn %d | no_kv_offload %d | rope %a %a | lora %zu",
+            llama_commit(), file(p.model.path).c_str(), file(p.speculative.draft.mparams.path).c_str(), file(p.mmproj.path).c_str(),
+            llama_n_ctx(ctx_tgt), ctx_dft ? (int) llama_n_ctx(ctx_dft) : 0, p.n_parallel, (int) p.cache_type_k, (int) p.cache_type_v,
+            (int) p.speculative.draft.cache_type_k, (int) p.speculative.draft.cache_type_v, p.swa_full, p.kv_unified,
+            (int) p.flash_attn_type, p.no_kv_offload, p.rope_freq_base, p.rope_freq_scale, p.lora_adapters.size());
+    }
+
+    // before the contexts go (shutdown, sleeping): the slots and the RAM entries to the disk tier
+    void flush_prompt_cache() {
+        if (!prompt_cache || !prompt_cache->disk || !ctx_tgt) {
+            return;
+        }
+        const int64_t t_start = ggml_time_us();
+        for (auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0 && slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+        }
+        prompt_cache->flush_to_disk();
+        SRV_INF("stored the prompt cache on disk in %.0f ms\n", (ggml_time_us() - t_start) / 1000.0);
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -959,6 +993,7 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            flush_prompt_cache();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1356,7 +1391,17 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
+            // the previous model's cache (after sleeping) first: it holds the disk directory's lock
+            prompt_cache.reset();
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (!params_base.cache_dir_path.empty() && params_base.cache_dir_max_mib != 0) {
+                const size_t limit = params_base.cache_dir_max_mib < 0 ? 0 : 1024ull*1024ull*params_base.cache_dir_max_mib;
+                auto disk = std::make_unique<server_prompt_cache_disk>(params_base.cache_dir_path, prompt_cache_key(), limit, mctx != nullptr);
+                if (disk->ok()) {
+                    prompt_cache->disk = std::move(disk);
+                }
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -4164,6 +4209,10 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // terminated (SIGTERM, SIGINT): what a restart should find
+    if (!impl->sleeping) {
+        impl->flush_prompt_cache();
+    }
 }
 
 void server_context::terminate() {

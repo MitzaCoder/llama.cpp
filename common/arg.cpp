@@ -1718,6 +1718,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-dir"}, "PATH",
+        "keep prompt cache entries evicted from RAM in this directory (not the model download cache), so they "
+        "come back after other conversations and after a restart (default: off, requires cache-ram)",
+        [](common_params & params, const std::string & value) {
+            params.cache_dir_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-dir-max"}, "N",
+        string_format("maximum size of --cache-dir in MiB, per model and settings (default: %d, -1 - no limit)", params.cache_dir_max_mib),
+        [](common_params & params, int value) {
+            params.cache_dir_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DIR_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

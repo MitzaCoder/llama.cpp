@@ -3,10 +3,14 @@
 #include "common.h"
 #include "llama.h"
 
-#include <string>
-#include <unordered_set>
+#include <condition_variable>
 #include <list>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_set>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -609,6 +613,68 @@ struct server_prompt_cache_state {
     }
 };
 
+// The prompt cache's second tier: entries that leave the RAM cache, kept as files in a directory, so
+// a conversation that others pushed out, or a restart, comes back without recomputing it. An entry
+// is handed to a writer thread as it leaves RAM (moved, not copied) and can be loaded once written.
+// Files are written with plain writes: no mapping that the GPU driver DMAs into.
+struct server_prompt_cache_disk {
+    // dir/<hash of key>/: `key` names what the states depend on (model files, cache types, build)
+    server_prompt_cache_disk(const std::string & dir, const std::string & key, size_t limit_bytes, bool has_mtmd);
+    ~server_prompt_cache_disk();
+
+    bool ok() const { return ok_; }
+
+    // queues a state for writing and takes it over; a written entry replaces those it extends
+    void put(server_prompt_cache_state && state);
+    // waits until everything queued is written
+    void flush();
+
+    // Loads the entry that keeps more of the new prompt than f_keep_best / f_sim_best into a slot:
+    // its states into ctx_tgt / ctx_dft (streamed from the file, not read into memory first), its
+    // tokens and checkpoints into `prompt`. 0: none is better, 1: loaded, -1: failed (and the
+    // entry dropped; the slot's state is lost).
+    int load_best(const server_tokens & tokens_new, float f_keep_best, float f_sim_best,
+                  llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, server_prompt & prompt);
+
+    // entries keep this many of their newest context checkpoints (ones a few tokens from a newer
+    // one do not count: they restore almost nothing more)
+    static constexpr size_t N_CHECKPOINTS = 3;
+
+private:
+    struct entry {
+        std::string path;                                           // <path>.bin, .tgt and .dft
+        bool has_dft = false;
+        llama_tokens tokens;                                        // LLAMA_TOKEN_NULL at media
+        std::map<size_t, std::pair<std::string, size_t>> media;     // start -> (chunk id, n_tokens)
+        size_t size = 0;
+        int64_t used = 0;                                           // the file's mtime, for LRU
+    };
+    static entry index_of(const server_tokens & tokens);
+    static size_t common_prefix(const entry & e, const server_tokens & t);
+    bool read_meta(const entry & e, server_prompt & out) const;
+    bool write(const server_prompt_cache_state & state, const std::string & path) const;
+    void scan();
+    void remove(size_t i);   // with mtx held
+    void writer_loop();
+
+    bool ok_ = false;
+    bool has_mtmd = false;
+    std::string root;
+    size_t limit = 0;         // bytes, 0 = no limit
+    size_t total = 0;
+    uint64_t n_written = 0;
+    int lock_fd = -1;
+
+    std::mutex mtx;           // guards everything below
+    std::condition_variable cv;
+    std::vector<entry> entries;
+    std::list<server_prompt_cache_state> queue;
+    size_t queued_bytes = 0;
+    bool writing = false;
+    bool stop = false;
+    std::thread writer;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -616,6 +682,14 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt_cache_state> states;
+
+    // where entries go when they leave RAM (nullptr: they are dropped)
+    std::unique_ptr<server_prompt_cache_disk> disk;
+
+    // an entry leaves RAM: to the disk tier if there is one
+    void evict(std::list<server_prompt_cache_state>::iterator it);
+    // every entry to the disk tier, waiting until written
+    void flush_to_disk();
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
