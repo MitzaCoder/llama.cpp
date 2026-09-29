@@ -2075,7 +2075,11 @@ server_prompt_cache_disk::~server_prompt_cache_disk() {
 
 server_prompt_cache_disk::entry server_prompt_cache_disk::index_of(const server_tokens & tokens) {
     entry e;
-    e.tokens = tokens.get_tokens();
+    // not get_tokens(): it asserts !has_mtmd, which holds for any server with --mmproj
+    e.tokens.resize(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        e.tokens[i] = tokens[i];
+    }
     for (size_t i = 0; i < e.tokens.size(); ++i) {
         if (e.tokens[i] != LLAMA_TOKEN_NULL) {
             continue;
